@@ -23,8 +23,7 @@ pub enum InsuranceError {
     PropertyNotInsurable,
     DuplicateClaim,
     ReentrantCall,
-    // Parametric insurance errors (Issue #249)
-    ParametricPolicyNotFound,
-    ParametricPolicyAlreadyTriggered,
-    ParametricPolicyInactive,
+    ReinsuranceAgreementNotFound,
+    ReinsuranceAgreementExpired,
+    ReinsuranceAgreementInactive,
 }
