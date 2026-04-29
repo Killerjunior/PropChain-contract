@@ -50,6 +50,8 @@ pub mod propchain_contracts {
         NotCompliant,
         /// Call to the compliance registry contract failed
         ComplianceCheckFailed,
+        /// An external dependency is currently unavailable due to circuit breaker state
+        ExternalDependencyUnavailable,
         /// Escrow does not exist
         EscrowNotFound,
         /// Escrow has already been released
@@ -112,6 +114,8 @@ pub mod propchain_contracts {
         ExternalDependencyUnavailable,
         /// Reentrancy guard detected a reentrant call
         ReentrantCall,
+        /// External dependency is temporarily unavailable because its circuit breaker is open
+        ExternalDependencyUnavailable,
     }
 
     impl From<crate::ReentrancyError> for Error {
@@ -140,6 +144,19 @@ pub mod propchain_contracts {
     }
 
     /// Circuit breaker state for external dependencies
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout))]
+    pub enum ExternalDependency {
+        Oracle,
+        ComplianceRegistry,
+        FeeManager,
+        IdentityRegistry,
+        PropertyManagement,
+        Bridge,
+        Insurance,
+        Governance,
+    }
+
     #[derive(
         Debug,
         Clone,
@@ -148,12 +165,17 @@ pub mod propchain_contracts {
         Default,
         scale::Encode,
         scale::Decode,
+        scale::Encode,
+        scale::Decode,
+        Default,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct CircuitBreakerState {
         pub failure_count: u8,
         pub total_failures: u32,
+        pub failure_count: u64,
+        pub total_failures: u64,
         pub last_failure_at: Option<u64>,
         pub open_until: Option<u64>,
     }
@@ -166,6 +188,7 @@ pub mod propchain_contracts {
         Eq,
         scale::Encode,
         scale::Decode,
+        Default,
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -181,6 +204,10 @@ pub mod propchain_contracts {
                 cooldown_period_secs: 300, // 5 minutes default
             }
         }
+    }
+
+        pub failure_threshold: u64,
+        pub cooldown_period_secs: u64,
     }
 
     /// Property Registry contract
@@ -252,6 +279,10 @@ pub mod propchain_contracts {
         /// `identity_registry` fields for new code; those fields are kept for
         /// backward-compatibility with existing callers.
         deps: ContainerConfig,
+        /// Circuit breaker state per external dependency.
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
+        /// Shared external call circuit breaker configuration.
+        external_call_config: CircuitBreakerConfig,
 
         /// Circuit breakers for external calls
         external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
@@ -260,7 +291,82 @@ pub mod propchain_contracts {
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
+        /// Circuit breaker configuration for external calls
+        external_call_config: CircuitBreakerConfig,
+        /// Circuit breaker states per external dependency
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
     }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        FeeManager,
+        Oracle,
+        ComplianceRegistry,
+        IdentityRegistry,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        pub failure_count: u8,
+        pub total_failures: u64,
+        pub last_failure_at: Option<u64>,
+        pub open_until: Option<u64>,
+    }
+
+    impl Default for CircuitBreakerState {
+        fn default() -> Self {
+            Self {
+                failure_count: 0,
+                total_failures: 0,
+                last_failure_at: None,
+                open_until: None,
+            }
+        }
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        pub failure_threshold: u8,
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300,
+            }
+        }
+    }
+
 
     /// Escrow information
     #[derive(
@@ -603,6 +709,79 @@ pub mod propchain_contracts {
         pub total_items_failed: u64,
         pub total_early_terminations: u64,
         pub largest_batch_processed: u32,
+    }
+
+    // =========================================================================
+    // CIRCUIT BREAKER TYPES
+    // =========================================================================
+
+    /// Identifies an external contract dependency that can be circuit-broken
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        Oracle,
+        ComplianceRegistry,
+        FeeManager,
+        IdentityRegistry,
+    }
+
+    /// Per-dependency circuit breaker runtime state
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Default,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        /// Consecutive failures since last reset
+        pub failure_count: u8,
+        /// Lifetime failure counter
+        pub total_failures: u64,
+        /// Timestamp of the most recent failure
+        pub last_failure_at: Option<u64>,
+        /// If set, the circuit is open until this timestamp
+        pub open_until: Option<u64>,
+    }
+
+    /// Static configuration for the circuit breaker
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        /// Number of consecutive failures before opening the circuit
+        pub failure_threshold: u8,
+        /// How long (in seconds) the circuit stays open before allowing retries
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300,
+            }
+        }
     }
 
     /// Badge types for property verification
@@ -1337,6 +1516,8 @@ pub mod propchain_contracts {
                 cached_analytics: CachedAnalytics::default(),
                 load_metrics: LoadMetrics::default(),
                 reentrancy_guard: ReentrancyGuard::new(),
+                external_call_config: CircuitBreakerConfig::default(),
+                external_call_breakers: Mapping::default(),
             };
 
             // Emit contract initialization event
@@ -1630,7 +1811,7 @@ pub mod propchain_contracts {
         #[ink(message)]
         pub fn configure_external_dependency_breaker(
             &mut self,
-            failure_threshold: u8,
+            failure_threshold: u64,
             cooldown_period_secs: u64,
         ) -> Result<(), Error> {
             if !self.ensure_admin_rbac() {
@@ -1705,6 +1886,7 @@ pub mod propchain_contracts {
         /// Update property valuation using the oracle
         #[ink(message)]
         pub fn update_valuation_from_oracle(&mut self, property_id: u64) -> Result<(), Error> {
+            self.ensure_dependency_available(ExternalDependency::Oracle)?;
             non_reentrant!(self, {
                 self.ensure_dependency_available(ExternalDependency::Oracle)?;
 
@@ -1721,6 +1903,7 @@ pub mod propchain_contracts {
                         self.record_dependency_success(ExternalDependency::Oracle);
                         val
                     }
+                    Ok(valuation) => valuation,
                     Err(_) => {
                         self.record_dependency_failure(ExternalDependency::Oracle);
                         return Err(Error::OracleError);
@@ -1733,8 +1916,10 @@ pub mod propchain_contracts {
                     self.properties.insert(&property_id, &property);
                 } else {
                     return Err(Error::PropertyNotFound);
+                    Ok(())
                 }
 
+                self.record_dependency_success(ExternalDependency::Oracle);
                 Ok(())
             })
         }
@@ -4736,6 +4921,10 @@ mod tests_pause {
         let breaker = contract.get_external_dependency_breaker(ExternalDependency::Oracle);
         assert_eq!(breaker.failure_count, 0);
         assert_eq!(breaker.open_until, None);
+        let state = contract.get_external_dependency_breaker(ExternalDependency::Oracle);
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(state.open_until, None);
+        assert_eq!(state.total_failures, 1);
     }
 
     #[ink::test]

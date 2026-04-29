@@ -112,14 +112,6 @@ pub mod property_token {
         /// Custom URI overrides for tokens
         token_uris: Mapping<TokenId, String>,
 
-        /// Staking state
-        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
-        share_total_staked: Mapping<TokenId, u128>,
-        share_reward_pool: Mapping<TokenId, u128>,
-        share_reward_rate_bps: Mapping<TokenId, u128>,
-        share_acc_reward_per_share: Mapping<TokenId, u128>,
-        share_last_reward_block: Mapping<TokenId, u64>,
-
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
         /// Snapshot functionality for governance voting (Issue #194)
@@ -127,19 +119,6 @@ pub mod property_token {
         snapshots: Mapping<(TokenId, u64), Snapshot>,
         account_snapshots: Mapping<(AccountId, TokenId, u64), u128>, // (account, token_id, snapshot_id) -> balance
 
-        // Staking fields (Issue #197)
-        /// Staking information per (staker, token_id)
-        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
-        /// Total staked shares per token
-        share_total_staked: Mapping<TokenId, u128>,
-        /// Accumulated reward per share (scaled by STAKE_SCALING)
-        share_acc_reward_per_share: Mapping<TokenId, u128>,
-        /// Last block number when rewards were calculated
-        share_last_reward_block: Mapping<TokenId, u64>,
-        /// Reward rate in basis points per year
-        share_reward_rate_bps: Mapping<TokenId, u128>,
-        /// Reward pool balance per token
-        share_reward_pool: Mapping<TokenId, u128>,
     }
 
     // Data types extracted to types.rs (Issue #101)
@@ -1457,11 +1436,82 @@ pub mod property_token {
                     .insert((to, token_id), &(to_balance.saturating_add(amount)));
                 Ok(())
             })
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let caller = self.env().caller();
+            if caller != from && !self.is_approved_for_all(from, caller) {
+                return Err(Error::Unauthorized);
+            }
+            if !self.pass_compliance(from)? || !self.pass_compliance(to)? {
+                return Err(Error::ComplianceFailed);
+            }
+
+            // Check KYC-based transfer restrictions for share transfers
+            self.verify_kyc_transfer(&from, &to, token_id, amount)?;
+
+            let from_balance = self.balances.get((from, token_id)).unwrap_or(0);
+            if from_balance < amount {
+                return Err(Error::InsufficientBalance);
+            }
+
+            // Update user transfer quota tracking
+            let mut quota =
+                self.user_transfer_quotas
+                    .get((token_id, from))
+                    .unwrap_or(UserTransferQuota {
+                        amount_transferred: 0,
+                        period_start_block: self.env().block_number(),
+                        acquisition_block: self.env().block_number(),
+                    });
+
+            quota.amount_transferred = quota.amount_transferred.saturating_add(amount);
+            self.user_transfer_quotas.insert((token_id, from), &quota);
+
+            self.update_dividend_credit_on_change(from, token_id)?;
+            self.update_dividend_credit_on_change(to, token_id)?;
+            self.balances
+                .insert((from, token_id), &(from_balance.saturating_sub(amount)));
+            let to_balance = self.balances.get((to, token_id)).unwrap_or(0);
+            self.balances
+                .insert((to, token_id), &(to_balance.saturating_add(amount)));
+            Ok(())
         }
 
         /// Deposits dividends for distribution to all share holders of a token.
         #[ink(message, payable)]
         pub fn deposit_dividends(&mut self, token_id: TokenId) -> Result<(), Error> {
+            let value = self.env().transferred_value();
+            if value == 0 {
+                return Err(Error::InvalidAmount);
+            }
+            let ts = self.total_shares.get(token_id).unwrap_or(0);
+            if ts == 0 {
+                return Err(Error::InvalidRequest);
+            }
+            let scaling: u128 = 1_000_000_000_000;
+            let add = value.saturating_mul(scaling) / ts;
+            let cur = self.dividends_per_share.get(token_id).unwrap_or(0);
+            let new = cur.saturating_add(add);
+            self.dividends_per_share.insert(token_id, &new);
+            self.env().emit_event(DividendsDeposited {
+                token_id,
+                amount: value,
+                per_share: add,
+            });
+            Ok(())
+        }
+
+        /// Distributes rental income for a token through the assigned management agent.
+        #[ink(message, payable)]
+        pub fn distribute_rental_income(&mut self, token_id: TokenId) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let owner = self.token_owner.get(token_id).ok_or(Error::TokenNotFound)?;
+            let manager = self.management_agent.get(token_id);
+            if caller != self.admin && caller != owner && Some(caller) != manager {
+                return Err(Error::Unauthorized);
+            }
+
             let value = self.env().transferred_value();
             if value == 0 {
                 return Err(Error::InvalidAmount);
@@ -1575,7 +1625,7 @@ pub mod property_token {
             {
                 return Err(Error::Unauthorized);
             }
-            let weight = self.balances.get((voter, token_id)).unwrap_or(0);
+            let weight = self.governance_weight(voter, token_id);
             if support {
                 proposal.for_votes = proposal.for_votes.saturating_add(weight);
             } else {
@@ -2088,7 +2138,7 @@ pub mod property_token {
             &self,
             account: &AccountId,
         ) -> Result<KYCVerificationLevel, Error> {
-            let current_block = self.env().block_number();
+            let current_block = u64::from(self.env().block_number());
 
             // Check cache first (cache for 100 blocks)
             if let Some((cached_level, cached_block)) = self.kyc_verification_cache.get(account) {
@@ -2122,7 +2172,7 @@ pub mod property_token {
             &self,
             from: &AccountId,
             to: &AccountId,
-            max_allowed_risk: u8,
+            _max_allowed_risk: u8,
         ) -> Result<(), Error> {
             // Check compliance for both sender and recipient
             if let Some(registry) = self.compliance_registry {

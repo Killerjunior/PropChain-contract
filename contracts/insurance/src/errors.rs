@@ -33,4 +33,7 @@ pub enum InsuranceError {
     HighFraudRisk,
     FraudPatternNotFound,
     InvalidFraudIndicator,
+    ReinsuranceAgreementNotFound,
+    ReinsuranceAgreementExpired,
+    ReinsuranceAgreementInactive,
 }

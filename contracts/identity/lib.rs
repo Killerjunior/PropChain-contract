@@ -229,6 +229,11 @@ pub mod propchain_identity {
         Tier2Standard,   // Standard KYC with document verification
         Tier3Enhanced,   // Enhanced due diligence
         Tier4Premium,    // Premium verification with full background check
+        Tier0_Unverified, // No KYC, basic access only
+        Tier1_Basic,      // Basic identity verification
+        Tier2_Standard,   // Standard KYC with document verification
+        Tier3_Enhanced,   // Enhanced due diligence
+        Tier4_Premium,    // Premium verification with full background check
     }
 
     /// KYC Tier privileges
@@ -1963,6 +1968,7 @@ pub mod propchain_identity {
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
                 .request_kyc_verification(provider_id, KycTier::Tier2Standard, Some([0xAB; 32]))
+                .request_kyc_verification(provider_id, KycTier::Tier2_Standard, Some([0xAB; 32]))
                 .unwrap();
 
             assert_eq!(request_id, 1);
@@ -2012,6 +2018,7 @@ pub mod propchain_identity {
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.bob);
             let request_id = reg
                 .request_kyc_verification(accounts.charlie, KycTier::Tier3Enhanced, None)
+                .request_kyc_verification(accounts.charlie, KycTier::Tier3_Enhanced, None)
                 .unwrap();
 
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.charlie);
