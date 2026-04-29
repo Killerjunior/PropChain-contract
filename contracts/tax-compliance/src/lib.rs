@@ -9,6 +9,8 @@ use propchain_traits::*;
 #[ink::contract]
 mod tax_compliance {
     use super::*;
+    mod tax_engine;
+    mod jurisdiction_presets;
 
     const BASIS_POINTS_DENOMINATOR: Balance = 10_000;
 
@@ -32,6 +34,139 @@ mod tax_compliance {
                 Self::Annual => 365 * 24 * 60 * 60 * 1000,
             }
         }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum RegionType {
+        US,
+        EU,
+        Asia,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct JurisdictionProfile {
+        pub surcharge_basis_points: u32,
+        pub early_payment_discount_basis_points: u32,
+        pub late_payment_grace_period: u64,
+        pub optimization_window: u64,
+        pub requires_digital_stamp: bool,
+        pub authority_hash: [u8; 32],
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct TaxBreakdown {
+        pub taxable_value: Balance,
+        pub base_tax: Balance,
+        pub fixed_charge: Balance,
+        pub surcharge_amount: Balance,
+        pub discount_amount: Balance,
+        pub penalty_amount: Balance,
+        pub total_due: Balance,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct OptimizationPlan {
+        pub estimated_savings: Balance,
+        pub recommended_installments: u32,
+        pub should_prepay: bool,
+        pub review_exemption: bool,
+        pub supporting_reference: [u8; 32],
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct PaymentReceipt {
+        pub property_id: u64,
+        pub jurisdiction_code: u32,
+        pub reporting_period: u64,
+        pub payment_reference: [u8; 32],
+        pub amount_paid: Balance,
+        pub outstanding_balance: Balance,
+        pub settled_at: Timestamp,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum LegalDocumentType {
+        TitleDeed,
+        TaxClearance,
+        OwnershipTransfer,
+        Mortgage,
+        Other,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum LegalDocumentStatus {
+        Pending,
+        Verified,
+        Rejected,
+        Expired,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum ComplianceAlertType {
+        RegistryNonCompliant,
+        TaxOverdue,
+        PaymentDueSoon,
+        ReportingMissing,
+        LegalDocumentsMissing,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub enum ComplianceAlertLevel {
+        Info,
+        Warning,
+        Critical,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+    #[cfg_attr(
+        feature = "std",
+        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+    )]
+    pub struct ComplianceAlert {
+        pub property_id: u64,
+        pub jurisdiction_code: u32,
+        pub reporting_period: u64,
+        pub alert_type: ComplianceAlertType,
+        pub level: ComplianceAlertLevel,
+        pub outstanding_tax: Balance,
+        pub due_at: Timestamp,
+        pub triggered_at: Timestamp,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
@@ -112,6 +247,8 @@ mod tax_compliance {
         pub taxable_value: Balance,
         pub tax_due: Balance,
         pub paid_amount: Balance,
+        pub penalty_amount: Balance,
+        pub discount_amount: Balance,
         pub due_at: Timestamp,
         pub last_payment_at: Timestamp,
         pub status: TaxStatus,
@@ -165,6 +302,7 @@ mod tax_compliance {
         pub outstanding_tax: Balance,
         pub reporting_submitted: bool,
         pub legal_documents_verified: bool,
+        pub active_alerts: u32,
         pub status: TaxStatus,
     }
 
@@ -433,6 +571,7 @@ mod tax_compliance {
         compliance_registry: Option<AccountId>,
         reentrancy_guard: ReentrancyGuard,
         tax_rules: Mapping<u32, TaxRule>,
+        jurisdiction_profiles: Mapping<u32, JurisdictionProfile>,
         property_assessments: Mapping<(u64, u32), PropertyAssessment>,
         #[allow(clippy::type_complexity)]
         tax_records: Mapping<(u64, u32, u64), TaxRecord>,
@@ -455,6 +594,7 @@ mod tax_compliance {
                 compliance_registry,
                 reentrancy_guard: ReentrancyGuard::new(),
                 tax_rules: Mapping::default(),
+                jurisdiction_profiles: Mapping::default(),
                 property_assessments: Mapping::default(),
                 tax_records: Mapping::default(),
                 latest_reporting_period: Mapping::default(),
@@ -494,6 +634,50 @@ mod tax_compliance {
                 0,
                 [0u8; 32],
             );
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn configure_jurisdiction_profile(
+            &mut self,
+            jurisdiction: Jurisdiction,
+            profile: JurisdictionProfile,
+        ) -> Result<()> {
+            self.ensure_admin()?;
+            self.jurisdiction_profiles.insert(jurisdiction.code, &profile);
+            self.log_audit(
+                0,
+                jurisdiction.code,
+                0,
+                AuditAction::RuleConfigured,
+                0,
+                profile.authority_hash,
+            );
+            Ok(())
+        }
+
+        #[ink(message)]
+        pub fn initialize_jurisdiction_presets(&mut self, region: RegionType) -> Result<()> {
+            self.ensure_admin()?;
+
+            match region {
+                RegionType::US => {
+                    let jurisdiction = jurisdiction_presets::jurisdiction_from_country(b"US");
+                    self.tax_rules.insert(jurisdiction.code, &jurisdiction_presets::us_federal_rule());
+                    self.jurisdiction_profiles.insert(jurisdiction.code, &jurisdiction_presets::us_federal_profile());
+                }
+                RegionType::EU => {
+                    let jurisdiction = jurisdiction_presets::jurisdiction_from_country(b"DE");
+                    self.tax_rules.insert(jurisdiction.code, &jurisdiction_presets::eu_standard_rule());
+                    self.jurisdiction_profiles.insert(jurisdiction.code, &jurisdiction_presets::eu_standard_profile());
+                }
+                RegionType::Asia => {
+                    let jurisdiction = jurisdiction_presets::jurisdiction_from_country(b"SG");
+                    self.tax_rules.insert(jurisdiction.code, &jurisdiction_presets::asia_standard_rule());
+                    self.jurisdiction_profiles.insert(jurisdiction.code, &jurisdiction_presets::asia_standard_profile());
+                }
+            }
+
             Ok(())
         }
 
@@ -593,21 +777,21 @@ mod tax_compliance {
                 self.tax_records
                     .insert((property_id, jurisdiction.code, reporting_period), &record);
                 self.latest_reporting_period
-                    .insert((property_id, jurisdiction.code), &reporting_period);
+                    .insert((property_id, jurisdiction.code), &record.reporting_period);
 
                 self.log_audit(
                     property_id,
                     jurisdiction.code,
-                    reporting_period,
+                    record.reporting_period,
                     AuditAction::TaxCalculated,
-                    tax_due,
+                    record.tax_due,
                     [0u8; 32],
                 );
                 self.env().emit_event(TaxCalculated {
                     property_id,
                     jurisdiction_code: jurisdiction.code,
-                    reporting_period,
-                    tax_due,
+                    reporting_period: record.reporting_period,
+                    tax_due: record.tax_due,
                 });
 
                 let snapshot = self.build_snapshot(
@@ -895,6 +1079,33 @@ mod tax_compliance {
         }
 
         #[ink(message)]
+        pub fn get_jurisdiction_profile(&self, jurisdiction_code: u32) -> Option<JurisdictionProfile> {
+            self.jurisdiction_profiles.get(jurisdiction_code)
+        }
+
+        #[ink(message)]
+        pub fn calculate_tax_breakdown(
+            &self,
+            property_id: u64,
+            jurisdiction_code: u32,
+            reporting_period: u64,
+        ) -> Result<TaxBreakdown> {
+            let rule = self.get_active_rule(jurisdiction_code)?;
+            let assessment = self
+                .property_assessments
+                .get((property_id, jurisdiction_code))
+                .ok_or(Error::AssessmentNotFound)?;
+            let record = self
+                .tax_records
+                .get((property_id, jurisdiction_code, reporting_period))
+                .ok_or(Error::RecordNotFound)?;
+            let profile = self.jurisdiction_profiles.get(jurisdiction_code);
+            let now = self.env().block_timestamp();
+
+            Ok(tax_engine::build_breakdown(rule, profile, assessment, record, now))
+        }
+
+        #[ink(message)]
         pub fn get_property_assessment(
             &self,
             property_id: u64,
@@ -1014,6 +1225,7 @@ mod tax_compliance {
                 outstanding_tax,
                 reporting_submitted: assessment.reporting_submitted,
                 legal_documents_verified: assessment.legal_documents_verified,
+                active_alerts: 0,
                 status,
             }
         }
