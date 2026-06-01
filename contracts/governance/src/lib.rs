@@ -94,6 +94,13 @@ mod governance {
         signer_public_keys: Mapping<AccountId, [u8; 33]>,
         /// Pending admin key rotation request
         pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
+        // ── Governance Delegation (Issue #231) ────────────────────────────────
+        /// Delegations: delegator -> delegate
+        governance_delegations: Mapping<AccountId, AccountId>,
+        /// Delegated voting power to a delegate
+        delegated_power: Mapping<AccountId, u32>,
+        /// Delegation expiry: (delegator, delegate) -> expiry block
+        delegation_expiry: Mapping<(AccountId, AccountId), u64>,
     }
 
     // =========================================================================
@@ -130,6 +137,9 @@ mod governance {
                 timelock_blocks,
                 signer_public_keys: Mapping::default(),
                 pending_admin_rotation: None,
+                governance_delegations: Mapping::default(),
+                delegated_power: Mapping::default(),
+                delegation_expiry: Mapping::default(),
             }
         }
 
@@ -163,6 +173,20 @@ mod governance {
         #[ink(message)]
         pub fn get_active_proposal_count(&self) -> u32 {
             self.active_proposal_count
+        }
+
+        // ── Delegation Queries (Issue #231) ───────────────────────────────────
+
+        /// Returns the delegate for a signer, if any.
+        #[ink(message)]
+        pub fn get_delegate(&self, delegator: AccountId) -> Option<AccountId> {
+            self.governance_delegations.get(&delegator)
+        }
+
+        /// Returns the delegated voting power for a delegate.
+        #[ink(message)]
+        pub fn get_delegated_power(&self, delegate: AccountId) -> u32 {
+            self.delegated_power.get(&delegate).unwrap_or(0)
         }
 
         // ----- Mutations -----
@@ -477,6 +501,64 @@ mod governance {
                 executed_at: now,
             });
 
+            Ok(())
+        }
+
+        // ── Delegation Messages (Issue #231) ─────────────────────────────────
+
+        /// Delegate voting power to another signer.
+        #[ink(message)]
+        pub fn delegate_governance(
+            &mut self,
+            delegate: AccountId,
+            expiry_blocks: Option<u64>,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            if !self.signers.contains(&delegate) {
+                return Err(Error::NotASigner);
+            }
+            if delegate == caller {
+                return Err(Error::InvalidThreshold);
+            }
+
+            // Remove old delegation if exists
+            if let Some(old_delegate) = self.governance_delegations.get(&caller) {
+                let old_power = self.delegated_power.get(&old_delegate).unwrap_or(0);
+                if old_power > 0 {
+                    self.delegated_power.insert(&old_delegate, &(old_power - 1));
+                }
+            }
+
+            self.governance_delegations.insert(&caller, &delegate);
+            let current_power = self.delegated_power.get(&delegate).unwrap_or(0);
+            self.delegated_power.insert(&delegate, &(current_power + 1));
+
+            // Set expiry if provided
+            if let Some(blocks) = expiry_blocks {
+                let expiry = (self.env().block_number() as u64).saturating_add(blocks);
+                self.delegation_expiry.insert(&(caller, delegate), &expiry);
+            }
+
+            Ok(())
+        }
+
+        /// Remove governance delegation.
+        #[ink(message)]
+        pub fn undelegate_governance(&mut self) -> Result<(), Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            if let Some(old_delegate) = self.governance_delegations.get(&caller) {
+                let old_power = self.delegated_power.get(&old_delegate).unwrap_or(0);
+                if old_power > 0 {
+                    self.delegated_power.insert(&old_delegate, &(old_power - 1));
+                }
+                self.delegation_expiry.remove(&(caller, old_delegate));
+            }
+
+            self.governance_delegations.remove(&caller);
             Ok(())
         }
 
