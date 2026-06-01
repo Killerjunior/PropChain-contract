@@ -68,6 +68,18 @@ mod governance {
         pub new_threshold: u32,
     }
 
+    // ── Discussion Forum Event (Issue #233) ─────────────────────────────────
+
+    #[ink(event)]
+    pub struct CommentAdded {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub author: AccountId,
+        pub discussion_id: u64,
+        pub parent_id: Option<u64>,
+    }
+
     #[ink(event)]
     pub struct EmergencyOverrideUsed {
         #[ink(topic)]
@@ -94,6 +106,19 @@ mod governance {
         signer_public_keys: Mapping<AccountId, [u8; 33]>,
         /// Pending admin key rotation request
         pending_admin_rotation: Option<propchain_traits::KeyRotationRequest>,
+        // ── Discussion Forum (Issue #233) ─────────────────────────────────────
+        /// Comments per proposal: proposal_id -> Vec<DiscussionComment>
+        proposal_comments: Mapping<u64, Vec<DiscussionComment>>,
+        /// Discussion counters per proposal: proposal_id -> u64
+        discussion_counters: Mapping<u64, u64>,
+        // ── Delegation (Issue #231) ───────────────────────────────────────────
+        /// Delegations: delegator -> delegate
+        governance_delegations: Mapping<AccountId, AccountId>,
+        /// Delegated voting power: account -> total delegated power
+        delegated_power: Mapping<AccountId, u32>,
+        // ── Quadratic Voting (Issue #229) ─────────────────────────────────────
+        /// Whether quadratic voting is enabled for a proposal
+        quadratic_voting_enabled: Mapping<u64, bool>,
     }
 
     // =========================================================================
@@ -130,6 +155,11 @@ mod governance {
                 timelock_blocks,
                 signer_public_keys: Mapping::default(),
                 pending_admin_rotation: None,
+                proposal_comments: Mapping::default(),
+                discussion_counters: Mapping::default(),
+                governance_delegations: Mapping::default(),
+                delegated_power: Mapping::default(),
+                quadratic_voting_enabled: Mapping::default(),
             }
         }
 
@@ -335,6 +365,12 @@ mod governance {
             }
         }
 
+        /// Returns all comments for a proposal.
+        #[ink(message)]
+        pub fn get_proposal_comments(&self, proposal_id: u64) -> Vec<DiscussionComment> {
+            self.proposal_comments.get(&proposal_id).unwrap_or_default()
+        }
+
         /// Returns the participation rate for a specific proposal in basis points.
         #[ink(message)]
         pub fn get_proposal_participation(&self, proposal_id: u64) -> Result<u32, Error> {
@@ -478,6 +514,54 @@ mod governance {
             });
 
             Ok(())
+        }
+
+        /// Add a comment to a proposal for discussion. Any signer may comment.
+        #[ink(message)]
+        pub fn add_comment(
+            &mut self,
+            proposal_id: u64,
+            content_hash: Hash,
+            parent_id: Option<u64>,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            self.ensure_signer(caller)?;
+
+            let proposal = self
+                .proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status == ProposalStatus::Executed
+                || proposal.status == ProposalStatus::Cancelled
+            {
+                return Err(Error::ProposalClosed);
+            }
+
+            let mut counter = self.discussion_counters.get(&proposal_id).unwrap_or(0);
+            counter += 1;
+
+            let comment = DiscussionComment {
+                discussion_id: counter,
+                author: caller,
+                content_hash,
+                parent_id,
+                created_at: self.env().block_number() as u64,
+            };
+
+            let mut comments = self.proposal_comments.get(&proposal_id).unwrap_or_default();
+            comments.push(comment);
+            self.proposal_comments.insert(&proposal_id, &comments);
+            self.discussion_counters.insert(&proposal_id, &counter);
+
+            self.env().emit_event(CommentAdded {
+                proposal_id,
+                author: caller,
+                discussion_id: counter,
+                parent_id,
+            });
+
+            Ok(counter)
         }
 
         /// Cancels an active proposal. Only the proposer or admin may cancel.
