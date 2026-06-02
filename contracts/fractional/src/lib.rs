@@ -4,6 +4,7 @@
 mod fractional {
     use ink::prelude::vec::Vec;
     use ink::storage::Mapping;
+    use propchain_traits::{non_reentrant, ReentrancyGuard};
 
     #[derive(
         Debug,
@@ -117,6 +118,14 @@ mod fractional {
         SlippageExceeded,
         InsufficientLiquidity,
         InsufficientLpShares,
+        /// A reentrant call was detected (issue #493).
+        ReentrantCall,
+    }
+
+    impl From<propchain_traits::ReentrancyError> for FractionalError {
+        fn from(_: propchain_traits::ReentrancyError) -> Self {
+            FractionalError::ReentrantCall
+        }
     }
 
     /// Emitted when an owner lists shares for sale
@@ -205,6 +214,8 @@ mod fractional {
         amm_pools: Mapping<u64, AmmPool>,
         /// LP token balances per (provider, token_id)
         lp_balances: Mapping<(AccountId, u64), u128>,
+        /// Reentrancy protection (issue #493)
+        reentrancy_guard: ReentrancyGuard,
     }
 
     impl Fractional {
@@ -217,6 +228,7 @@ mod fractional {
                 total_shares: Mapping::default(),
                 amm_pools: Mapping::default(),
                 lp_balances: Mapping::default(),
+                reentrancy_guard: ReentrancyGuard::new(),
             }
         }
     }
@@ -374,6 +386,7 @@ mod fractional {
             token_id: u64,
             shares: u128,
         ) -> Result<(), FractionalError> {
+            non_reentrant!(self, {
             if shares == 0 {
                 return Err(FractionalError::ZeroAmount);
             }
@@ -436,6 +449,7 @@ mod fractional {
                 total_price,
             });
             Ok(())
+            })
         }
 
         /// Redeem shares for their proportional value based on the last recorded price.
@@ -446,6 +460,7 @@ mod fractional {
             token_id: u64,
             shares: u128,
         ) -> Result<u128, FractionalError> {
+            non_reentrant!(self, {
             if shares == 0 {
                 return Err(FractionalError::ZeroAmount);
             }
@@ -482,6 +497,7 @@ mod fractional {
                 payout,
             });
             Ok(payout)
+            })
         }
 
         /// Get an active listing
@@ -502,6 +518,7 @@ mod fractional {
             share_amount: u128,
             min_lp_out: u128,
         ) -> Result<u128, FractionalError> {
+            non_reentrant!(self, {
             if share_amount == 0 {
                 return Err(FractionalError::ZeroAmount);
             }
@@ -574,6 +591,7 @@ mod fractional {
                 lp_minted,
             });
             Ok(lp_minted)
+            })
         }
 
         /// Burn `lp_amount` LP tokens and withdraw proportional shares + value.
@@ -585,6 +603,7 @@ mod fractional {
             min_shares_out: u128,
             min_value_out: u128,
         ) -> Result<(u128, u128), FractionalError> {
+            non_reentrant!(self, {
             if lp_amount == 0 {
                 return Err(FractionalError::ZeroAmount);
             }
@@ -645,6 +664,7 @@ mod fractional {
                 lp_burned: lp_amount,
             });
             Ok((shares_out, value_out))
+            })
         }
 
         /// Sell `shares_in` shares into the AMM pool, receiving native value out.
@@ -657,6 +677,7 @@ mod fractional {
             shares_in: u128,
             min_value_out: u128,
         ) -> Result<u128, FractionalError> {
+            non_reentrant!(self, {
             if shares_in == 0 {
                 return Err(FractionalError::ZeroAmount);
             }
@@ -727,6 +748,7 @@ mod fractional {
                 new_spot_price: new_spot,
             });
             Ok(value_out)
+            })
         }
 
         /// Returns the current spot price (value per share) for `token_id`'s AMM pool.
@@ -770,6 +792,12 @@ mod fractional {
             }
             x
         }
+
+        /// Record a trade for analytics (no-op stub — extend for on-chain analytics).
+        fn record_trade(&mut self, _token_id: u64, _volume: u128, _price: u128) {}
+
+        /// Update the holder count for analytics (no-op stub — extend for on-chain analytics).
+        fn update_holder(&mut self, _account: AccountId, _token_id: u64, _balance: u128) {}
     }
 
     #[cfg(test)]
@@ -1025,6 +1053,138 @@ mod fractional {
             assert_eq!(Fractional::isqrt(4), 2);
             assert_eq!(Fractional::isqrt(9), 3);
             assert_eq!(Fractional::isqrt(10_000), 100);
+        }
+
+        // ── Issue #493: Reentrancy guard tests ───────────────────────────────
+
+        /// Test that calling buy_shares while the guard is locked returns ReentrantCall.
+        /// We simulate this by manually locking the guard before the call.
+        #[ink::test]
+        fn test_reentrant_buy_shares_returns_error() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 100);
+            f.list_shares_for_sale(1, 50, 10).unwrap();
+
+            // Manually lock the guard to simulate a reentrant call
+            f.reentrancy_guard.enter().expect("first lock should succeed");
+
+            test::set_caller::<ink::env::DefaultEnvironment>(bob());
+            // While guard is locked, buy_shares should return ReentrantCall
+            let result = f.buy_shares(alice(), 1, 10);
+            assert_eq!(
+                result,
+                Err(FractionalError::ReentrantCall),
+                "buy_shares must return ReentrantCall when guard is locked (issue #493)"
+            );
+
+            // Unlock so the guard does not stay poisoned
+            f.reentrancy_guard.exit();
+        }
+
+        /// Test that calling swap_shares_for_value while the guard is locked returns ReentrantCall.
+        #[ink::test]
+        fn test_reentrant_swap_shares_for_value_returns_error() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(10_000);
+            f.add_liquidity(1, 100, 0).unwrap();
+
+            // Manually lock the guard to simulate a reentrant call
+            f.reentrancy_guard.enter().expect("first lock should succeed");
+
+            let result = f.swap_shares_for_value(1, 10, 0);
+            assert_eq!(
+                result,
+                Err(FractionalError::ReentrantCall),
+                "swap_shares_for_value must return ReentrantCall when guard is locked (issue #493)"
+            );
+
+            f.reentrancy_guard.exit();
+        }
+
+        /// Test that redeem_shares is guarded and returns ReentrantCall when locked.
+        #[ink::test]
+        fn test_reentrant_redeem_shares_returns_error() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 100);
+            f.set_last_price(1, 5);
+
+            f.reentrancy_guard.enter().expect("first lock should succeed");
+
+            let result = f.redeem_shares(1, 10);
+            assert_eq!(
+                result,
+                Err(FractionalError::ReentrantCall),
+                "redeem_shares must return ReentrantCall when guard is locked (issue #493)"
+            );
+
+            f.reentrancy_guard.exit();
+        }
+
+        /// Test that add_liquidity is guarded and returns ReentrantCall when locked.
+        #[ink::test]
+        fn test_reentrant_add_liquidity_returns_error() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            f.reentrancy_guard.enter().expect("first lock should succeed");
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(500);
+            let result = f.add_liquidity(1, 100, 0);
+            assert_eq!(
+                result,
+                Err(FractionalError::ReentrantCall),
+                "add_liquidity must return ReentrantCall when guard is locked (issue #493)"
+            );
+
+            f.reentrancy_guard.exit();
+        }
+
+        /// Test that remove_liquidity is guarded and returns ReentrantCall when locked.
+        #[ink::test]
+        fn test_reentrant_remove_liquidity_returns_error() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 1000);
+
+            test::set_value_transferred::<ink::env::DefaultEnvironment>(1000);
+            let lp = f.add_liquidity(1, 200, 0).unwrap();
+
+            f.reentrancy_guard.enter().expect("first lock should succeed");
+
+            let result = f.remove_liquidity(1, lp, 0, 0);
+            assert_eq!(
+                result,
+                Err(FractionalError::ReentrantCall),
+                "remove_liquidity must return ReentrantCall when guard is locked (issue #493)"
+            );
+
+            f.reentrancy_guard.exit();
+        }
+
+        /// Test that after a non-reentrant call completes, the guard is unlocked
+        /// and a subsequent call succeeds normally.
+        #[ink::test]
+        fn test_guard_releases_after_successful_call() {
+            let mut f = Fractional::new();
+            test::set_caller::<ink::env::DefaultEnvironment>(alice());
+            f.mint_shares(alice(), 1, 200);
+            f.set_last_price(1, 5);
+
+            // First call: guard enters and exits normally
+            let payout1 = f.redeem_shares(1, 50).unwrap();
+            assert_eq!(payout1, 250);
+
+            // Guard should be unlocked — second call must succeed
+            let payout2 = f.redeem_shares(1, 50).unwrap();
+            assert_eq!(payout2, 250);
+
+            assert!(!f.reentrancy_guard.is_locked(), "guard must be unlocked after call");
         }
     }
 }
